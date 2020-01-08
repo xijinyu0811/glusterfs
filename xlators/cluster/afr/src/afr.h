@@ -1112,7 +1112,8 @@ afr_cleanup_fd_ctx(xlator_t *this, fd_t *fd);
             if (__local && __local->is_read_txn)                               \
                 afr_pending_read_decrement(__this->private,                    \
                                            __local->read_subvol);              \
-            if (__local && afr_is_lock_mode_mandatory(__local->xdata_req))     \
+            if (__local && __local->xdata_req &&                               \
+                afr_is_lock_mode_mandatory(__local->xdata_req))                \
                 afr_dom_lock_release(frame);                                   \
             frame->local = NULL;                                               \
         }                                                                      \
@@ -1379,8 +1380,8 @@ void
 afr_ta_locked_priv_invalidate(afr_private_t *priv);
 
 gf_boolean_t
-afr_lookup_has_quorum(call_frame_t *frame, xlator_t *this,
-                      unsigned char *subvols);
+afr_lookup_has_quorum(call_frame_t *frame,
+                      const unsigned int up_children_count);
 
 void
 afr_mark_new_entry_changelog(call_frame_t *frame, xlator_t *this);

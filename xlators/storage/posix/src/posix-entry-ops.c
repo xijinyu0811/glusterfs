@@ -108,7 +108,7 @@ posix_symlinks_match(xlator_t *this, loc_t *loc, uuid_t gfid)
              loc->pargfid[0], loc->pargfid[1], uuid_utoa(loc->pargfid),
              loc->name);
 
-    MAKE_HANDLE_GFID_PATH(dir_handle, this, gfid, NULL);
+    MAKE_HANDLE_GFID_PATH(dir_handle, this, gfid);
     len = sys_readlink(dir_handle, linkname_actual, PATH_MAX);
     if (len < 0 || len == PATH_MAX) {
         if (len == PATH_MAX) {
@@ -329,6 +329,38 @@ out:
         dict_unref(xattr);
 
     return 0;
+}
+
+static int32_t
+posix_set_gfid2path_xattr(xlator_t *this, const char *path, uuid_t pgfid,
+                          const char *bname)
+{
+    char xxh64[GF_XXH64_DIGEST_LENGTH * 2 + 1] = {
+        0,
+    };
+    char pgfid_bname[1024] = {
+        0,
+    };
+    char *key = NULL;
+    const size_t key_size = GFID2PATH_XATTR_KEY_PREFIX_LENGTH +
+                            GF_XXH64_DIGEST_LENGTH * 2 + 1;
+    int ret = 0;
+    int len;
+
+    len = snprintf(pgfid_bname, sizeof(pgfid_bname), "%s/%s", uuid_utoa(pgfid),
+                   bname);
+    gf_xxh64_wrapper((unsigned char *)pgfid_bname, len,
+                     GF_XXHSUM64_DEFAULT_SEED, xxh64);
+    key = alloca(key_size);
+    snprintf(key, key_size, GFID2PATH_XATTR_KEY_PREFIX "%s", xxh64);
+
+    ret = sys_lsetxattr(path, key, pgfid_bname, len, XATTR_CREATE);
+    if (ret == -1) {
+        gf_msg(this->name, GF_LOG_WARNING, errno, P_MSG_PGFID_OP,
+               "setting gfid2path xattr failed on %s: key = %s ", path, key);
+    }
+
+    return ret;
 }
 
 int
@@ -645,12 +677,13 @@ posix_mkdir(call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
     if (!gf_uuid_is_null(uuid_req)) {
         op_ret = posix_istat(this, loc->inode, uuid_req, NULL, &stbuf);
         if ((op_ret == 0) && IA_ISDIR(stbuf.ia_type)) {
-            size = posix_handle_path(this, uuid_req, NULL, NULL, 0);
-            if (size > 0)
-                gfid_path = alloca(size);
-
-            if (gfid_path)
-                posix_handle_path(this, uuid_req, NULL, gfid_path, size);
+            gfid_path = alloca(PATH_MAX);
+            size = posix_handle_path(this, uuid_req, NULL, gfid_path, PATH_MAX);
+            if (size <= 0) {
+                op_errno = ESTALE;
+                op_ret = -1;
+                goto out;
+            }
 
             if (frame->root->pid != GF_CLIENT_PID_SELF_HEALD) {
                 gf_msg(this->name, GF_LOG_WARNING, 0, P_MSG_DIR_OF_SAME_ID,
@@ -930,12 +963,12 @@ posix_move_gfid_to_unlink(xlator_t *this, uuid_t gfid, loc_t *loc)
 {
     char *unlink_path = NULL;
     char *gfid_path = NULL;
-    int ret = 0;
+    int ret = -1;
     struct posix_private *priv_posix = NULL;
 
     priv_posix = (struct posix_private *)this->private;
 
-    MAKE_HANDLE_GFID_PATH(gfid_path, this, gfid, NULL);
+    MAKE_HANDLE_GFID_PATH(gfid_path, this, gfid);
 
     POSIX_GET_FILE_UNLINK_PATH(priv_posix->base_path, loc->inode->gfid,
                                unlink_path);
@@ -1079,6 +1112,38 @@ posix_skip_non_linkto_unlink(dict_t *xdata, loc_t *loc, char *key,
     return skip_unlink;
 }
 
+static int32_t
+posix_remove_gfid2path_xattr(xlator_t *this, const char *path, uuid_t pgfid,
+                             const char *bname)
+{
+    char xxh64[GF_XXH64_DIGEST_LENGTH * 2 + 1] = {
+        0,
+    };
+    char pgfid_bname[1024] = {
+        0,
+    };
+    int ret = 0;
+    char *key = NULL;
+    const size_t key_size = GFID2PATH_XATTR_KEY_PREFIX_LENGTH +
+                            GF_XXH64_DIGEST_LENGTH * 2 + 1;
+    int len;
+
+    len = snprintf(pgfid_bname, sizeof(pgfid_bname), "%s/%s", uuid_utoa(pgfid),
+                   bname);
+    gf_xxh64_wrapper((unsigned char *)pgfid_bname, len,
+                     GF_XXHSUM64_DEFAULT_SEED, xxh64);
+    key = alloca(key_size);
+    snprintf(key, key_size, GFID2PATH_XATTR_KEY_PREFIX "%s", xxh64);
+
+    ret = sys_lremovexattr(path, key);
+    if (ret == -1) {
+        gf_msg(this->name, GF_LOG_WARNING, errno, P_MSG_PGFID_OP,
+               "removing gfid2path xattr failed on %s: key = %s", path, key);
+    }
+
+    return ret;
+}
+
 int32_t
 posix_unlink(call_frame_t *frame, xlator_t *this, loc_t *loc, int xflag,
              dict_t *xdata)
@@ -1108,9 +1173,6 @@ posix_unlink(call_frame_t *frame, xlator_t *this, loc_t *loc, int xflag,
     int32_t skip_unlink = 0;
     int32_t fdstat_requested = 0;
     dict_t *unwind_dict = NULL;
-    void *uuid = NULL;
-    char uuid_str[GF_UUID_BUF_SIZE] = {0};
-    char gfid_str[GF_UUID_BUF_SIZE] = {0};
     gf_boolean_t get_link_count = _gf_false;
     posix_inode_ctx_t *ctx = NULL;
 
@@ -1139,21 +1201,6 @@ posix_unlink(call_frame_t *frame, xlator_t *this, loc_t *loc, int xflag,
     }
 
     priv = this->private;
-
-    op_ret = dict_get_ptr(xdata, TIER_LINKFILE_GFID, &uuid);
-
-    if (!op_ret && gf_uuid_compare(uuid, stbuf.ia_gfid)) {
-        op_errno = ENOENT;
-        op_ret = -1;
-        gf_uuid_unparse(uuid, uuid_str);
-        gf_uuid_unparse(stbuf.ia_gfid, gfid_str);
-        gf_msg_debug(this->name, op_errno,
-                     "Mismatch in gfid for path "
-                     "%s. Aborting the unlink. loc->gfid = %s, "
-                     "stbuf->ia_gfid = %s",
-                     real_path, uuid_str, gfid_str);
-        goto out;
-    }
 
     op_ret = dict_get_int32_sizen(xdata, DHT_SKIP_OPEN_FD_UNLINK,
                                   &check_open_fd);
@@ -1185,10 +1232,6 @@ posix_unlink(call_frame_t *frame, xlator_t *this, loc_t *loc, int xflag,
     skip_unlink = posix_skip_non_linkto_unlink(
         xdata, loc, DHT_SKIP_NON_LINKTO_UNLINK,
         SLEN(DHT_SKIP_NON_LINKTO_UNLINK), DHT_LINKTO, &stbuf, real_path);
-    skip_unlink = skip_unlink || posix_skip_non_linkto_unlink(
-                                     xdata, loc, TIER_SKIP_NON_LINKTO_UNLINK,
-                                     SLEN(TIER_SKIP_NON_LINKTO_UNLINK),
-                                     TIER_LINKTO, &stbuf, real_path);
     if (skip_unlink) {
         op_ret = -1;
         op_errno = EBUSY;
@@ -1653,7 +1696,6 @@ posix_rename(call_frame_t *frame, xlator_t *this, loc_t *oldloc, loc_t *newloc,
 
     priv = this->private;
     VALIDATE_OR_GOTO(priv, out);
-    DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, op_ret, op_errno, out);
 
     SET_FS_ID(frame->root->uid, frame->root->gid);
     MAKE_ENTRY_HANDLE(real_oldpath, par_oldpath, this, oldloc, NULL);

@@ -45,8 +45,6 @@ glusterfs_volfile_fetch(glusterfs_ctx_t *ctx);
 int
 glusterfs_process_volfp(glusterfs_ctx_t *ctx, FILE *fp);
 int
-glusterfs_graph_unknown_options(glusterfs_graph_t *graph);
-int
 emancipate(glusterfs_ctx_t *ctx, int ret);
 int
 glusterfs_process_svc_attach_volfp(glusterfs_ctx_t *ctx, FILE *fp,
@@ -65,6 +63,11 @@ glusterfs_process_svc_detach(glusterfs_ctx_t *ctx, gf_volfile_t *volfile_obj);
 
 gf_boolean_t
 mgmt_is_multiplexed_daemon(char *name);
+
+static int
+glusterfs_volume_top_perf(const char *brick_path, dict_t *dict,
+                          gf_boolean_t write_test);
+
 int
 mgmt_cbk_spec(struct rpc_clnt *rpc, void *mydata, void *data)
 {
@@ -475,10 +478,6 @@ glusterfs_handle_translator_info_get(rpcsvc_request_t *req)
     dict_t *dict = NULL;
     xlator_t *this = NULL;
     gf1_cli_top_op top_op = 0;
-    uint32_t blk_size = 0;
-    uint32_t blk_count = 0;
-    double time = 0;
-    double throughput = 0;
     xlator_t *any = NULL;
     xlator_t *xlator = NULL;
     glusterfs_graph_t *active = NULL;
@@ -511,35 +510,23 @@ glusterfs_handle_translator_info_get(rpcsvc_request_t *req)
     }
 
     ret = dict_get_int32(dict, "top-op", (int32_t *)&top_op);
-    if ((!ret) &&
-        (GF_CLI_TOP_READ_PERF == top_op || GF_CLI_TOP_WRITE_PERF == top_op)) {
-        ret = dict_get_uint32(dict, "blk-size", &blk_size);
-        if (ret)
-            goto cont;
-        ret = dict_get_uint32(dict, "blk-cnt", &blk_count);
-        if (ret)
-            goto cont;
-
-        if (GF_CLI_TOP_READ_PERF == top_op) {
-            ret = glusterfs_volume_top_read_perf(
-                blk_size, blk_count, xlator_req.name, &throughput, &time);
-        } else if (GF_CLI_TOP_WRITE_PERF == top_op) {
-            ret = glusterfs_volume_top_write_perf(
-                blk_size, blk_count, xlator_req.name, &throughput, &time);
-        }
-        if (ret)
-            goto cont;
-        ret = dict_set_double(dict, "time", time);
-        if (ret)
-            goto cont;
-        ret = dict_set_double(dict, "throughput", throughput);
-        if (ret)
-            goto cont;
+    if (ret)
+        goto cont;
+    if (GF_CLI_TOP_READ_PERF == top_op) {
+        ret = glusterfs_volume_top_perf(xlator_req.name, dict, _gf_false);
+    } else if (GF_CLI_TOP_WRITE_PERF == top_op) {
+        ret = glusterfs_volume_top_perf(xlator_req.name, dict, _gf_true);
     }
+
 cont:
     ctx = glusterfsd_ctx;
     GF_ASSERT(ctx);
     active = ctx->active;
+    if (active == NULL) {
+        gf_log(THIS->name, GF_LOG_ERROR, "ctx->active returned NULL");
+        ret = -1;
+        goto out;
+    }
     any = active->first;
 
     xlator = get_xlator_by_name(any, xlator_req.name);
@@ -576,100 +563,11 @@ out:
     return ret;
 }
 
-int
-glusterfs_volume_top_write_perf(uint32_t blk_size, uint32_t blk_count,
-                                char *brick_path, double *throughput,
-                                double *time)
+static int
+glusterfs_volume_top_perf(const char *brick_path, dict_t *dict,
+                          gf_boolean_t write_test)
 {
     int32_t fd = -1;
-    int32_t input_fd = -1;
-    char export_path[PATH_MAX] = {
-        0,
-    };
-    char *buf = NULL;
-    int32_t iter = 0;
-    int32_t ret = -1;
-    uint64_t total_blks = 0;
-    struct timeval begin, end = {
-                              0,
-                          };
-
-    GF_ASSERT(brick_path);
-    GF_ASSERT(throughput);
-    GF_ASSERT(time);
-    if (!(blk_size > 0) || !(blk_count > 0))
-        goto out;
-
-    snprintf(export_path, sizeof(export_path), "%s/%s", brick_path,
-             ".gf-tmp-stats-perf");
-
-    fd = open(export_path, O_CREAT | O_RDWR, S_IRWXU);
-    if (-1 == fd) {
-        ret = -1;
-        gf_log("glusterd", GF_LOG_ERROR, "Could not open tmp file");
-        goto out;
-    }
-
-    buf = GF_MALLOC(blk_size * sizeof(*buf), gf_common_mt_char);
-    if (!buf) {
-        ret = -1;
-        goto out;
-    }
-
-    input_fd = open("/dev/zero", O_RDONLY);
-    if (-1 == input_fd) {
-        ret = -1;
-        gf_log("glusterd", GF_LOG_ERROR, "Unable to open input file");
-        goto out;
-    }
-
-    gettimeofday(&begin, NULL);
-    for (iter = 0; iter < blk_count; iter++) {
-        ret = sys_read(input_fd, buf, blk_size);
-        if (ret != blk_size) {
-            ret = -1;
-            goto out;
-        }
-        ret = sys_write(fd, buf, blk_size);
-        if (ret != blk_size) {
-            ret = -1;
-            goto out;
-        }
-        total_blks += ret;
-    }
-    ret = 0;
-    if (total_blks != ((uint64_t)blk_size * blk_count)) {
-        gf_log("glusterd", GF_LOG_WARNING, "Error in write");
-        ret = -1;
-        goto out;
-    }
-
-    gettimeofday(&end, NULL);
-    *time = (end.tv_sec - begin.tv_sec) * 1e6 + (end.tv_usec - begin.tv_usec);
-    *throughput = total_blks / *time;
-    gf_log("glusterd", GF_LOG_INFO,
-           "Throughput %.2f Mbps time %.2f secs "
-           "bytes written %" PRId64,
-           *throughput, *time, total_blks);
-
-out:
-    if (fd >= 0)
-        sys_close(fd);
-    if (input_fd >= 0)
-        sys_close(input_fd);
-    GF_FREE(buf);
-    sys_unlink(export_path);
-
-    return ret;
-}
-
-int
-glusterfs_volume_top_read_perf(uint32_t blk_size, uint32_t blk_count,
-                               char *brick_path, double *throughput,
-                               double *time)
-{
-    int32_t fd = -1;
-    int32_t input_fd = -1;
     int32_t output_fd = -1;
     char export_path[PATH_MAX] = {
         0,
@@ -678,15 +576,32 @@ glusterfs_volume_top_read_perf(uint32_t blk_size, uint32_t blk_count,
     int32_t iter = 0;
     int32_t ret = -1;
     uint64_t total_blks = 0;
+    uint32_t blk_size;
+    uint32_t blk_count;
+    double throughput = 0;
+    double time = 0;
     struct timeval begin, end = {
                               0,
                           };
 
     GF_ASSERT(brick_path);
-    GF_ASSERT(throughput);
-    GF_ASSERT(time);
+
+    ret = dict_get_uint32(dict, "blk-size", &blk_size);
+    if (ret)
+        goto out;
+    ret = dict_get_uint32(dict, "blk-cnt", &blk_count);
+    if (ret)
+        goto out;
+
     if (!(blk_size > 0) || !(blk_count > 0))
         goto out;
+
+    buf = GF_CALLOC(1, blk_size * sizeof(*buf), gf_common_mt_char);
+    if (!buf) {
+        ret = -1;
+        gf_log("glusterd", GF_LOG_ERROR, "Could not allocate memory");
+        goto out;
+    }
 
     snprintf(export_path, sizeof(export_path), "%s/%s", brick_path,
              ".gf-tmp-stats-perf");
@@ -697,38 +612,34 @@ glusterfs_volume_top_read_perf(uint32_t blk_size, uint32_t blk_count,
         goto out;
     }
 
-    buf = GF_MALLOC(blk_size * sizeof(*buf), gf_common_mt_char);
-    if (!buf) {
-        ret = -1;
-        gf_log("glusterd", GF_LOG_ERROR, "Could not allocate memory");
-        goto out;
-    }
-
-    input_fd = open("/dev/zero", O_RDONLY);
-    if (-1 == input_fd) {
-        ret = -1;
-        gf_log("glusterd", GF_LOG_ERROR, "Could not open input file");
-        goto out;
-    }
-
-    output_fd = open("/dev/null", O_RDWR);
-    if (-1 == output_fd) {
-        ret = -1;
-        gf_log("glusterd", GF_LOG_ERROR, "Could not open output file");
-        goto out;
-    }
-
+    gettimeofday(&begin, NULL);
     for (iter = 0; iter < blk_count; iter++) {
-        ret = sys_read(input_fd, buf, blk_size);
-        if (ret != blk_size) {
-            ret = -1;
-            goto out;
-        }
         ret = sys_write(fd, buf, blk_size);
         if (ret != blk_size) {
             ret = -1;
             goto out;
         }
+        total_blks += ret;
+    }
+    gettimeofday(&end, NULL);
+    if (total_blks != ((uint64_t)blk_size * blk_count)) {
+        gf_log("glusterd", GF_LOG_WARNING, "Error in write");
+        ret = -1;
+        goto out;
+    }
+
+    time = (end.tv_sec - begin.tv_sec) * 1e6 + (end.tv_usec - begin.tv_usec);
+    throughput = total_blks / time;
+    gf_log("glusterd", GF_LOG_INFO,
+           "Throughput %.2f Mbps time %.2f secs "
+           "bytes written %" PRId64,
+           throughput, time, total_blks);
+
+    /* if it's a write test, we are done. Otherwise, we continue to the read
+     * part */
+    if (write_test == _gf_true) {
+        ret = 0;
+        goto out;
     }
 
     ret = sys_fsync(fd);
@@ -742,6 +653,16 @@ glusterfs_volume_top_read_perf(uint32_t blk_size, uint32_t blk_count,
         ret = -1;
         goto out;
     }
+
+    output_fd = open("/dev/null", O_RDWR);
+    if (-1 == output_fd) {
+        ret = -1;
+        gf_log("glusterd", GF_LOG_ERROR, "Could not open output file");
+        goto out;
+    }
+
+    total_blks = 0;
+
     gettimeofday(&begin, NULL);
     for (iter = 0; iter < blk_count; iter++) {
         ret = sys_read(fd, buf, blk_size);
@@ -756,31 +677,36 @@ glusterfs_volume_top_read_perf(uint32_t blk_size, uint32_t blk_count,
         }
         total_blks += ret;
     }
-    ret = 0;
+    gettimeofday(&end, NULL);
     if (total_blks != ((uint64_t)blk_size * blk_count)) {
         ret = -1;
         gf_log("glusterd", GF_LOG_WARNING, "Error in read");
         goto out;
     }
 
-    gettimeofday(&end, NULL);
-    *time = (end.tv_sec - begin.tv_sec) * 1e6 + (end.tv_usec - begin.tv_usec);
-    *throughput = total_blks / *time;
+    time = (end.tv_sec - begin.tv_sec) * 1e6 + (end.tv_usec - begin.tv_usec);
+    throughput = total_blks / time;
     gf_log("glusterd", GF_LOG_INFO,
            "Throughput %.2f Mbps time %.2f secs "
            "bytes read %" PRId64,
-           *throughput, *time, total_blks);
-
+           throughput, time, total_blks);
+    ret = 0;
 out:
     if (fd >= 0)
         sys_close(fd);
-    if (input_fd >= 0)
-        sys_close(input_fd);
     if (output_fd >= 0)
         sys_close(output_fd);
     GF_FREE(buf);
     sys_unlink(export_path);
-
+    if (ret == 0) {
+        ret = dict_set_double(dict, "time", time);
+        if (ret)
+            goto end;
+        ret = dict_set_double(dict, "throughput", throughput);
+        if (ret)
+            goto end;
+    }
+end:
     return ret;
 }
 
@@ -1034,44 +960,51 @@ glusterfs_handle_attach(rpcsvc_request_t *req)
     }
     ret = 0;
 
+    if (!this->ctx->active) {
+        gf_log(this->name, GF_LOG_WARNING,
+               "got attach for %s but no active graph", xlator_req.name);
+        goto post_unlock;
+    }
+
+    gf_log(this->name, GF_LOG_INFO, "got attach for %s", xlator_req.name);
+
     LOCK(&ctx->volfile_lock);
     {
-        if (this->ctx->active) {
-            gf_log(this->name, GF_LOG_INFO, "got attach for %s",
-                   xlator_req.name);
-            ret = glusterfs_graph_attach(this->ctx->active, xlator_req.name,
-                                         &newgraph);
-            if (!ret && (newgraph && newgraph->first)) {
-                nextchild = newgraph->first;
-                ret = xlator_notify(nextchild, GF_EVENT_PARENT_UP, nextchild);
-                if (ret) {
-                    gf_msg(this->name, GF_LOG_ERROR, 0,
-                           LG_MSG_EVENT_NOTIFY_FAILED,
-                           "Parent up notification "
-                           "failed for %s ",
-                           nextchild->name);
-                    goto out;
-                }
-                /* we need a protocol/server xlator as
-                 * nextchild
-                 */
-                srv_xl = this->ctx->active->first;
-                srv_conf = (server_conf_t *)srv_xl->private;
-                rpcsvc_autoscale_threads(this->ctx, srv_conf->rpc, 1);
+        ret = glusterfs_graph_attach(this->ctx->active, xlator_req.name,
+                                     &newgraph);
+        if (!ret && (newgraph && newgraph->first)) {
+            nextchild = newgraph->first;
+            ret = xlator_notify(nextchild, GF_EVENT_PARENT_UP, nextchild);
+            if (ret) {
+                gf_msg(this->name, GF_LOG_ERROR, 0, LG_MSG_EVENT_NOTIFY_FAILED,
+                       "Parent up notification "
+                       "failed for %s ",
+                       nextchild->name);
+                goto unlock;
             }
-        } else {
-            gf_log(this->name, GF_LOG_WARNING,
-                   "got attach for %s but no active graph", xlator_req.name);
+            /* we need a protocol/server xlator as
+             * nextchild
+             */
+            srv_xl = this->ctx->active->first;
+            srv_conf = (server_conf_t *)srv_xl->private;
+            rpcsvc_autoscale_threads(this->ctx, srv_conf->rpc, 1);
         }
         if (ret) {
             ret = -1;
         }
-
-        glusterfs_translator_info_response_send(req, ret, NULL, NULL);
-
-    out:
+        ret = glusterfs_translator_info_response_send(req, ret, NULL, NULL);
+        if (ret) {
+            /* Response sent back to glusterd, req is already destroyed. So
+             * resetting the ret to 0. Otherwise another response will be
+             * send from rpcsvc_check_and_reply_error. Which will lead to
+             * double resource leak.
+             */
+            ret = 0;
+        }
+    unlock:
         UNLOCK(&ctx->volfile_lock);
     }
+post_unlock:
     if (xlator_req.dict.dict_val)
         free(xlator_req.dict.dict_val);
     free(xlator_req.input.input_val);
@@ -1565,10 +1498,12 @@ glusterfs_handle_node_status(rpcsvc_request_t *req)
     }
     any = active->first;
 
-    if ((cmd & GF_CLI_STATUS_NFS) != 0)
-        ret = gf_asprintf(&node_name, "%s", "nfs-server");
-    else if ((cmd & GF_CLI_STATUS_SHD) != 0)
+    if ((cmd & GF_CLI_STATUS_SHD) != 0)
         ret = gf_asprintf(&node_name, "%s", "glustershd");
+#ifdef BUILD_GNFS
+    else if ((cmd & GF_CLI_STATUS_NFS) != 0)
+        ret = gf_asprintf(&node_name, "%s", "nfs-server");
+#endif
     else if ((cmd & GF_CLI_STATUS_QUOTAD) != 0)
         ret = gf_asprintf(&node_name, "%s", "quotad");
     else if ((cmd & GF_CLI_STATUS_BITD) != 0)
@@ -1911,6 +1846,11 @@ glusterfs_handle_barrier(rpcsvc_request_t *req)
     ctx = glusterfsd_ctx;
     GF_ASSERT(ctx);
     active = ctx->active;
+    if (active == NULL) {
+        gf_log(THIS->name, GF_LOG_ERROR, "ctx->active returned NULL");
+        ret = -1;
+        goto out;
+    }
     top = active->first;
 
     for (trav = top->children; trav; trav = trav->next) {
@@ -2230,10 +2170,12 @@ mgmt_getspec_cbk(struct rpc_req *req, struct iovec *iov, int count,
     }
     dict->extra_stdfree = rsp.xdata.xdata_val;
 
-    /* glusterd2 only */
     ret = dict_get_str(dict, "servers-list", &servers_list);
     if (ret) {
-        goto volfile;
+        /* Server list is set by glusterd at the time of getspec */
+        ret = dict_get_str(dict, GLUSTERD_BRICK_SERVERS, &servers_list);
+        if (ret)
+            goto volfile;
     }
 
     gf_log(frame->this->name, GF_LOG_INFO,
@@ -2852,50 +2794,6 @@ glusterfs_listener_init(glusterfs_ctx_t *ctx)
 out:
     if (options)
         dict_unref(options);
-    return ret;
-}
-
-int
-glusterfs_listener_stop(glusterfs_ctx_t *ctx)
-{
-    cmd_args_t *cmd_args = NULL;
-    rpcsvc_t *rpc = NULL;
-    rpcsvc_listener_t *listener = NULL;
-    rpcsvc_listener_t *next = NULL;
-    int ret = 0;
-    xlator_t *this = NULL;
-
-    GF_ASSERT(ctx);
-
-    rpc = ctx->listener;
-    ctx->listener = NULL;
-
-    (void)rpcsvc_program_unregister(rpc, &glusterfs_mop_prog);
-
-    list_for_each_entry_safe(listener, next, &rpc->listeners, list)
-    {
-        rpcsvc_listener_destroy(listener);
-    }
-
-    (void)rpcsvc_unregister_notify(rpc, glusterfs_rpcsvc_notify, THIS);
-
-    GF_FREE(rpc);
-
-    cmd_args = &ctx->cmd_args;
-    if (cmd_args->sock_file) {
-        ret = sys_unlink(cmd_args->sock_file);
-        if (ret && (ENOENT == errno)) {
-            ret = 0;
-        }
-    }
-
-    if (ret) {
-        this = THIS;
-        gf_log(this->name, GF_LOG_ERROR,
-               "Failed to unlink listener "
-               "socket %s, error: %s",
-               cmd_args->sock_file, strerror(errno));
-    }
     return ret;
 }
 

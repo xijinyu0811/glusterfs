@@ -522,18 +522,19 @@ posix_do_futimes(xlator_t *this, int fd, struct iatt *stbuf, int valid)
     struct stat stat = {
         0,
     };
-
-    ret = sys_fstat(fd, &stat);
-    if (ret != 0) {
-        gf_msg(this->name, GF_LOG_WARNING, errno, P_MSG_FILE_OP_FAILED, "%d",
-               fd);
-        goto out;
-    }
+    gf_boolean_t fstat_executed = _gf_false;
 
     if ((valid & GF_SET_ATTR_ATIME) == GF_SET_ATTR_ATIME) {
         tv[0].tv_sec = stbuf->ia_atime;
         tv[0].tv_usec = stbuf->ia_atime_nsec / 1000;
     } else {
+        ret = sys_fstat(fd, &stat);
+        if (ret != 0) {
+            gf_msg(this->name, GF_LOG_WARNING, errno, P_MSG_FILE_OP_FAILED,
+                   "%d", fd);
+            goto out;
+        }
+        fstat_executed = _gf_true;
         /* atime is not given, use current values */
         tv[0].tv_sec = ST_ATIM_SEC(&stat);
         tv[0].tv_usec = ST_ATIM_NSEC(&stat) / 1000;
@@ -543,6 +544,14 @@ posix_do_futimes(xlator_t *this, int fd, struct iatt *stbuf, int valid)
         tv[1].tv_sec = stbuf->ia_mtime;
         tv[1].tv_usec = stbuf->ia_mtime_nsec / 1000;
     } else {
+        if (!fstat_executed) {
+            ret = sys_fstat(fd, &stat);
+            if (ret != 0) {
+                gf_msg(this->name, GF_LOG_WARNING, errno, P_MSG_FILE_OP_FAILED,
+                       "%d", fd);
+                goto out;
+            }
+        }
         /* mtime is not given, use current values */
         tv[1].tv_sec = ST_MTIM_SEC(&stat);
         tv[1].tv_usec = ST_MTIM_NSEC(&stat) / 1000;
@@ -689,6 +698,10 @@ posix_do_fallocate(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t flags,
     gf_boolean_t locked = _gf_false;
     posix_inode_ctx_t *ctx = NULL;
     struct posix_private *priv = NULL;
+    gf_boolean_t check_space_error = _gf_false;
+    struct stat statbuf = {
+        0,
+    };
 
     DECLARE_OLD_FS_ID_VAR;
 
@@ -708,7 +721,10 @@ posix_do_fallocate(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t flags,
     if (priv->disk_reserve)
         posix_disk_space_check(this);
 
-    DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, ret, ret, out);
+    DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, ret, ret, unlock);
+
+overwrite:
+    check_space_error = _gf_true;
 
     ret = posix_fd_ctx_get(fd, this, &pfd, &op_errno);
     if (ret < 0) {
@@ -732,7 +748,7 @@ posix_do_fallocate(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t flags,
         ret = -errno;
         gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_FSTAT_FAILED,
                "fallocate (fstat) failed on fd=%p", fd);
-        goto out;
+        goto unlock;
     }
 
     if (xdata) {
@@ -742,7 +758,7 @@ posix_do_fallocate(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t flags,
             gf_msg(this->name, GF_LOG_ERROR, 0, 0,
                    "file state check failed, fd %p", fd);
             ret = -EIO;
-            goto out;
+            goto unlock;
         }
     }
 
@@ -753,7 +769,7 @@ posix_do_fallocate(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t flags,
                "fallocate failed on %s offset: %jd, "
                "len:%zu, flags: %d",
                uuid_utoa(fd->inode->gfid), offset, len, flags);
-        goto out;
+        goto unlock;
     }
 
     ret = posix_fdstat(this, fd->inode, pfd->fd, statpost);
@@ -761,16 +777,47 @@ posix_do_fallocate(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t flags,
         ret = -errno;
         gf_msg(this->name, GF_LOG_ERROR, errno, P_MSG_FSTAT_FAILED,
                "fallocate (fstat) failed on fd=%p", fd);
-        goto out;
+        goto unlock;
     }
 
     posix_set_ctime(frame, this, NULL, pfd->fd, fd->inode, statpost);
 
-out:
+unlock:
     if (locked) {
         pthread_mutex_unlock(&ctx->write_atomic_lock);
         locked = _gf_false;
     }
+
+    if (op_errno == ENOSPC && priv->disk_space_full && !check_space_error) {
+#ifdef FALLOC_FL_KEEP_SIZE
+        if (flags & FALLOC_FL_KEEP_SIZE) {
+            goto overwrite;
+        }
+#endif
+        ret = posix_fd_ctx_get(fd, this, &pfd, &op_errno);
+        if (ret < 0) {
+            gf_msg(this->name, GF_LOG_WARNING, ret, P_MSG_PFD_NULL,
+                   "pfd is NULL from fd=%p", fd);
+            goto out;
+        }
+
+        if (sys_fstat(pfd->fd, &statbuf) < 0) {
+            gf_msg(this->name, GF_LOG_WARNING, op_errno, P_MSG_FILE_OP_FAILED,
+                   "%d", pfd->fd);
+            goto out;
+        }
+
+        if (offset + len <= statbuf.st_size) {
+            gf_msg_debug(this->name, 0,
+                         "io vector size will not"
+                         " change disk size so allow overwrite for"
+                         " fd %d",
+                         pfd->fd);
+            goto overwrite;
+        }
+    }
+
+out:
     SET_TO_OLD_FS_ID();
     if (ret == ENOSPC)
         ret = -ENOSPC;
@@ -1080,25 +1127,57 @@ posix_zerofill(call_frame_t *frame, xlator_t *this, fd_t *fd, off_t offset,
     int op_ret = -1;
     int op_errno = EINVAL;
     dict_t *rsp_xdata = NULL;
+    gf_boolean_t check_space_error = _gf_false;
+    struct posix_fd *pfd = NULL;
+    struct stat statbuf = {
+        0,
+    };
 
-    VALIDATE_OR_GOTO(frame, out);
-    VALIDATE_OR_GOTO(this, out);
+    VALIDATE_OR_GOTO(frame, unwind);
+    VALIDATE_OR_GOTO(this, unwind);
 
     priv = this->private;
     DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, op_ret, op_errno, out);
 
+overwrite:
+    check_space_error = _gf_true;
     ret = posix_do_zerofill(frame, this, fd, offset, len, &statpre, &statpost,
                             xdata, &rsp_xdata);
     if (ret < 0) {
         op_ret = -1;
         op_errno = -ret;
-        goto out;
+        goto unwind;
     }
 
     STACK_UNWIND_STRICT(zerofill, frame, 0, 0, &statpre, &statpost, rsp_xdata);
     return 0;
 
 out:
+    if (op_errno == ENOSPC && priv->disk_space_full && !check_space_error) {
+        ret = posix_fd_ctx_get(fd, this, &pfd, &op_errno);
+        if (ret < 0) {
+            gf_msg(this->name, GF_LOG_WARNING, ret, P_MSG_PFD_NULL,
+                   "pfd is NULL from fd=%p", fd);
+            goto out;
+        }
+
+        if (sys_fstat(pfd->fd, &statbuf) < 0) {
+            gf_msg(this->name, GF_LOG_WARNING, op_errno, P_MSG_FILE_OP_FAILED,
+                   "%d", pfd->fd);
+            goto out;
+        }
+
+        if (offset + len <= statbuf.st_size) {
+            gf_msg_debug(this->name, 0,
+                         "io vector size will not"
+                         " change disk size so allow overwrite for"
+                         " fd %d",
+                         pfd->fd);
+            goto overwrite;
+        }
+    }
+
+unwind:
     STACK_UNWIND_STRICT(zerofill, frame, op_ret, op_errno, NULL, NULL,
                         rsp_xdata);
     return 0;
@@ -1863,19 +1942,28 @@ posix_writev(call_frame_t *frame, xlator_t *this, fd_t *fd,
     gf_boolean_t write_append = _gf_false;
     gf_boolean_t update_atomic = _gf_false;
     posix_inode_ctx_t *ctx = NULL;
+    gf_boolean_t check_space_error = _gf_false;
+    struct stat statbuf = {
+        0,
+    };
+    int totlen = 0;
+    int idx = 0;
 
-    VALIDATE_OR_GOTO(frame, out);
-    VALIDATE_OR_GOTO(this, out);
-    VALIDATE_OR_GOTO(fd, out);
-    VALIDATE_OR_GOTO(fd->inode, out);
-    VALIDATE_OR_GOTO(vector, out);
-    VALIDATE_OR_GOTO(this->private, out);
+    VALIDATE_OR_GOTO(frame, unwind);
+    VALIDATE_OR_GOTO(this, unwind);
+    VALIDATE_OR_GOTO(fd, unwind);
+    VALIDATE_OR_GOTO(fd->inode, unwind);
+    VALIDATE_OR_GOTO(vector, unwind);
+    VALIDATE_OR_GOTO(this->private, unwind);
 
     priv = this->private;
 
-    VALIDATE_OR_GOTO(priv, out);
+    VALIDATE_OR_GOTO(priv, unwind);
     DISK_SPACE_CHECK_AND_GOTO(frame, priv, xdata, op_ret, op_errno, out);
 
+overwrite:
+
+    check_space_error = _gf_true;
     if ((fd->inode->ia_type == IA_IFBLK) || (fd->inode->ia_type == IA_IFCHR)) {
         gf_msg(this->name, GF_LOG_ERROR, EINVAL, P_MSG_INVALID_ARGUMENT,
                "writev received on a block/char file (%s)",
@@ -2017,6 +2105,36 @@ out:
         locked = _gf_false;
     }
 
+    if (op_errno == ENOSPC && priv->disk_space_full && !check_space_error) {
+        ret = posix_fd_ctx_get(fd, this, &pfd, &op_errno);
+        if (ret < 0) {
+            gf_msg(this->name, GF_LOG_WARNING, ret, P_MSG_PFD_NULL,
+                   "pfd is NULL from fd=%p", fd);
+            goto unwind;
+        }
+
+        if (sys_fstat(pfd->fd, &statbuf) < 0) {
+            gf_msg(this->name, GF_LOG_WARNING, op_errno, P_MSG_FILE_OP_FAILED,
+                   "%d", pfd->fd);
+            goto unwind;
+        }
+
+        for (idx = 0; idx < count; idx++) {
+            totlen = vector[idx].iov_len;
+        }
+
+        if ((offset + totlen <= statbuf.st_size) &&
+            !(statbuf.st_blocks * statbuf.st_blksize < statbuf.st_size)) {
+            gf_msg_debug(this->name, 0,
+                         "io vector size will not"
+                         " change disk size so allow overwrite for"
+                         " fd %d",
+                         pfd->fd);
+            goto overwrite;
+        }
+    }
+
+unwind:
     STACK_UNWIND_STRICT(writev, frame, op_ret, op_errno, &preop, &postop,
                         rsp_xdata);
 
@@ -2052,6 +2170,7 @@ posix_copy_file_range(call_frame_t *frame, xlator_t *this, fd_t *fd_in,
     gf_boolean_t locked = _gf_false;
     gf_boolean_t update_atomic = _gf_false;
     posix_inode_ctx_t *ctx = NULL;
+    char in_uuid_str[64] = {0}, out_uuid_str[64] = {0};
 
     VALIDATE_OR_GOTO(frame, out);
     VALIDATE_OR_GOTO(this, out);
@@ -2192,8 +2311,8 @@ posix_copy_file_range(call_frame_t *frame, xlator_t *this, fd_t *fd_in,
         gf_msg(this->name, GF_LOG_ERROR, op_errno, P_MSG_COPY_FILE_RANGE_FAILED,
                "copy_file_range failed: fd_in: %p (gfid: %s) ,"
                " fd_out %p (gfid:%s)",
-               fd_in, uuid_utoa(fd_in->inode->gfid), fd_out,
-               uuid_utoa(fd_out->inode->gfid));
+               fd_in, uuid_utoa_r(fd_in->inode->gfid, in_uuid_str), fd_out,
+               uuid_utoa_r(fd_out->inode->gfid, out_uuid_str));
         goto out;
     }
 
@@ -4390,7 +4509,7 @@ posix_common_removexattr(call_frame_t *frame, loc_t *loc, fd_t *fd,
         ret = posix_fdstat(this, inode, _fd, &preop);
         if (ret) {
             gf_msg(this->name, GF_LOG_WARNING, errno, P_MSG_FDSTAT_FAILED,
-                   "fdstat operaton failed on %s", real_path);
+                   "fdstat operaton failed on %s", real_path ? real_path : "");
         }
     }
 
@@ -5297,20 +5416,13 @@ posix_fill_readdir(fd_t *fd, DIR *dir, off_t off, size_t size,
     }
 
     if (skip_dirs) {
-        len = posix_handle_path(this, fd->inode->gfid, NULL, NULL, 0);
+        hpath = alloca(PATH_MAX);
+        len = posix_handle_path(this, fd->inode->gfid, NULL, hpath, PATH_MAX);
         if (len <= 0) {
             errno = ESTALE;
             count = -1;
             goto out;
         }
-        hpath = alloca(len + 256); /* NAME_MAX */
-
-        if (posix_handle_path(this, fd->inode->gfid, NULL, hpath, len) <= 0) {
-            errno = ESTALE;
-            count = -1;
-            goto out;
-        }
-
         len = strlen(hpath);
         hpath[len] = '/';
     }
@@ -5478,22 +5590,14 @@ posix_readdirp_fill(xlator_t *this, fd_t *fd, gf_dirent_t *entries,
 
     itable = fd->inode->table;
 
-    len = posix_handle_path(this, fd->inode->gfid, NULL, NULL, 0);
+    hpath = alloca(PATH_MAX);
+    len = posix_handle_path(this, fd->inode->gfid, NULL, hpath, PATH_MAX);
     if (len <= 0) {
         gf_msg(this->name, GF_LOG_WARNING, 0, P_MSG_HANDLEPATH_FAILED,
                "Failed to create handle path, fd=%p, gfid=%s", fd,
                uuid_utoa(fd->inode->gfid));
         return -1;
     }
-
-    hpath = alloca(len + 256); /* NAME_MAX */
-    if (posix_handle_path(this, fd->inode->gfid, NULL, hpath, len) <= 0) {
-        gf_msg(this->name, GF_LOG_WARNING, 0, P_MSG_HANDLEPATH_FAILED,
-               "Failed to create handle path, fd=%p, gfid=%s", fd,
-               uuid_utoa(fd->inode->gfid));
-        return -1;
-    }
-
     len = strlen(hpath);
     hpath[len] = '/';
 

@@ -62,8 +62,6 @@ GF_OP_RETRIES = 10
 
 GX_GFID_CANONICAL_LEN = 37  # canonical gfid len + '\0'
 
-CHANGELOG_AGENT_SERVER_VERSION = 1.0
-CHANGELOG_AGENT_CLIENT_VERSION = 1.0
 NodeID = None
 rsync_version = None
 unshare_mnt_propagation = None
@@ -337,7 +335,7 @@ def log_raise_exception(excont):
             logtag = "FULL EXCEPTION TRACE"
         if logtag:
             logging.exception(logtag + ": ")
-            sys.stderr.write("failed with %s.\n" % type(exc).__name__)
+            sys.stderr.write("failed with %s: %s.\n" % (type(exc).__name__, exc))
         excont.exval = 1
         sys.exit(excont.exval)
 

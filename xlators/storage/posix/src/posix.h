@@ -51,14 +51,14 @@
 #define ACL_BUFFER_MAX 4096 /* size of character buffer */
 
 #define DHT_LINKTO "trusted.glusterfs.dht.linkto"
-/*
- * TIER_MODE need to be changed when we stack tiers
- */
-#define TIER_LINKTO "trusted.tier.tier-dht.linkto"
 
 #define POSIX_GFID_HANDLE_SIZE(base_path_len)                                  \
     (base_path_len + SLEN("/") + SLEN(GF_HIDDEN_PATH) + SLEN("/") +            \
      SLEN("00/") + SLEN("00/") + SLEN(UUID0_STR) + 1) /* '\0' */;
+
+#define POSIX_GFID_HANDLE_RELSIZE                                              \
+    SLEN("../") + SLEN("../") + SLEN("00/") + SLEN("00/") + SLEN(UUID0_STR) + 1;
+
 #define GF_UNLINK_TRUE 0x0000000000000001
 #define GF_UNLINK_FALSE 0x0000000000000000
 
@@ -384,9 +384,6 @@ posix_resolve_dirgfid_to_path(const uuid_t dirgfid, const char *brick_path,
                               const char *bname, char **path);
 void
 posix_gfid_unset(xlator_t *this, dict_t *xdata);
-
-int
-posix_pacl_set(const char *path, int fdnum, const char *key, const char *acl_s);
 
 int
 posix_pacl_get(const char *path, int fdnum, const char *key, char **acl_s);

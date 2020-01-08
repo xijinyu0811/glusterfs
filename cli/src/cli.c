@@ -84,6 +84,9 @@ rpc_clnt_prog_t *cli_rpc_prog;
 
 extern struct rpc_clnt_program cli_prog;
 
+int cli_default_conn_timeout = 120;
+int cli_ten_minutes_timeout = 600;
+
 static int
 glusterfs_ctx_defaults_init(glusterfs_ctx_t *ctx)
 {
@@ -851,10 +854,6 @@ main(int argc, char *argv[])
         goto out;
 
     ret = cli_cmds_register(&state);
-    if (ret)
-        goto out;
-
-    ret = cli_cmd_cond_init();
     if (ret)
         goto out;
 

@@ -2054,8 +2054,7 @@ cli_cmd_log_rotate_cbk(struct cli_state *state, struct cli_cmd_word *word,
         goto out;
     }
 
-    if (!((strcmp("rotate", words[2]) == 0) ||
-          (strcmp("rotate", words[3]) == 0))) {
+    if (!(strcmp("rotate", words[3]) == 0)) {
         cli_usage_out(word->pattern);
         parse_error = 1;
         goto out;
@@ -2175,7 +2174,7 @@ cli_cmd_volume_gsync_set_cbk(struct cli_state *state, struct cli_cmd_word *word,
 
     proc = &cli_rpc_prog->proctable[GLUSTER_CLI_GSYNC_SET];
 
-    ret = cli_cmd_gsync_set_parse(words, wordcount, &options, &errstr);
+    ret = cli_cmd_gsync_set_parse(state, words, wordcount, &options, &errstr);
     if (ret) {
         if (errstr) {
             cli_err("%s", errstr);
@@ -2564,7 +2563,7 @@ cli_launch_glfs_heal(int heal_op, dict_t *options)
 
     runinit(&runner);
     ret = dict_get_str(options, "volname", &volname);
-    runner_add_args(&runner, SBIN_DIR "/glfsheal", volname, NULL);
+    runner_add_args(&runner, GLFSHEAL_PREFIX "/glfsheal", volname, NULL);
     runner_redir(&runner, STDOUT_FILENO, RUN_PIPE);
 
     switch (heal_op) {
@@ -3084,10 +3083,6 @@ struct cli_cmd volume_cmds[] = {
 
     {"volume log <VOLNAME> rotate [BRICK]", cli_cmd_log_rotate_cbk,
      "rotate the log file for corresponding volume/brick"},
-
-    {"volume log rotate <VOLNAME> [BRICK]", cli_cmd_log_rotate_cbk,
-     "rotate the log file for corresponding volume/brick"
-     " NOTE: This is an old syntax, will be deprecated from next release."},
 
     {"volume sync <HOSTNAME> [all|<VOLNAME>]", cli_cmd_sync_volume_cbk,
      "sync the volume information from a peer"},

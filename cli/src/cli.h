@@ -40,8 +40,8 @@ enum argp_option_keys {
     ARGP_PORT_KEY = 'p',
 };
 
-int cli_default_conn_timeout;
-int cli_ten_minutes_timeout;
+extern int cli_default_conn_timeout;
+extern int cli_ten_minutes_timeout;
 
 typedef enum {
     COLD_BRICK_COUNT,
@@ -267,8 +267,8 @@ int32_t
 cli_cmd_volume_reset_parse(const char **words, int wordcount, dict_t **opt);
 
 int32_t
-cli_cmd_gsync_set_parse(const char **words, int wordcount, dict_t **opt,
-                        char **errstr);
+cli_cmd_gsync_set_parse(struct cli_state *state, const char **words,
+                        int wordcount, dict_t **opt, char **errstr);
 
 int32_t
 cli_cmd_quota_parse(const char **words, int wordcount, dict_t **opt);
@@ -488,9 +488,6 @@ cli_xml_output_snapshot(int cmd_type, dict_t *dict, int op_ret, int op_errno,
 int
 cli_xml_snapshot_status_single_snap(cli_local_t *local, dict_t *dict,
                                     char *key);
-char *
-is_server_debug_xlator(void *myframe);
-
 int32_t
 cli_cmd_snapshot_parse(const char **words, int wordcount, dict_t **options,
                        struct cli_state *state);

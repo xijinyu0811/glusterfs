@@ -19,7 +19,7 @@
 #include <string.h>
 #include <dlfcn.h>
 
-void
+static void
 cs_cleanup_private(cs_private_t *priv)
 {
     if (priv) {
@@ -35,7 +35,7 @@ cs_cleanup_private(cs_private_t *priv)
     return;
 }
 
-struct cs_plugin plugins[] = {
+static struct cs_plugin plugins[] = {
     {.name = "cloudsyncs3",
      .library = "cloudsyncs3.so",
      .description = "cloudsync s3 store."},
@@ -83,8 +83,8 @@ cs_init(xlator_t *this)
     per_vol = _gf_true;
 
     if (per_vol) {
-        if (dict_get_str(this->options, "cloudsync-storetype", &temp_str) ==
-            0) {
+        if (dict_get_str_sizen(this->options, "cloudsync-storetype",
+                               &temp_str) == 0) {
             for (index = 0; plugins[index].name; index++) {
                 if (!strcmp(temp_str, plugins[index].name)) {
                     libname = plugins[index].library;
@@ -388,7 +388,6 @@ int32_t
 cs_truncate(call_frame_t *frame, xlator_t *this, loc_t *loc, off_t offset,
             dict_t *xdata)
 {
-    int op_errno = -1;
     cs_local_t *local = NULL;
     int ret = 0;
     cs_inode_ctx_t *ctx = NULL;
@@ -401,14 +400,13 @@ cs_truncate(call_frame_t *frame, xlator_t *this, loc_t *loc, off_t offset,
     local = cs_local_init(this, frame, loc, NULL, GF_FOP_TRUNCATE);
     if (!local) {
         gf_msg(this->name, GF_LOG_ERROR, 0, 0, "local init failed");
-        op_errno = ENOMEM;
         goto err;
     }
 
     __cs_inode_ctx_get(this, loc->inode, &ctx);
 
     if (ctx)
-        state = __cs_get_file_state(this, loc->inode, ctx);
+        state = __cs_get_file_state(loc->inode, ctx);
     else
         state = GF_CS_LOCAL;
 
@@ -427,7 +425,6 @@ cs_truncate(call_frame_t *frame, xlator_t *this, loc_t *loc, off_t offset,
                                     xdata);
     if (!local->stub) {
         gf_msg(this->name, GF_LOG_ERROR, 0, 0, "insufficient memory");
-        op_errno = ENOMEM;
         goto err;
     }
 
@@ -439,14 +436,13 @@ cs_truncate(call_frame_t *frame, xlator_t *this, loc_t *loc, off_t offset,
         local->call_cnt++;
         ret = locate_and_execute(frame);
         if (ret) {
-            op_errno = ENOMEM;
             goto err;
         }
     }
 
     return 0;
 err:
-    CS_STACK_UNWIND(truncate, frame, -1, op_errno, NULL, NULL, NULL);
+    CS_STACK_UNWIND(truncate, frame, -1, ENOMEM, NULL, NULL, NULL);
     return 0;
 }
 
@@ -518,7 +514,7 @@ cs_setxattr(call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *dict,
 
     local->xattr_req = xdata ? dict_ref(xdata) : (xdata = dict_new());
 
-    tmp = dict_get(dict, GF_CS_OBJECT_UPLOAD_COMPLETE);
+    tmp = dict_get_sizen(dict, GF_CS_OBJECT_UPLOAD_COMPLETE);
     if (tmp) {
         /* Value of key should be the atime */
         local->stub = fop_setxattr_stub(frame, cs_resume_setxattr, loc, dict,
@@ -1028,7 +1024,8 @@ cs_set_xattr_req(call_frame_t *frame)
      * hierarchy and name need not be the same on remote store as that of
      * the gluster volume.
      */
-    ret = dict_set_str(local->xattr_req, GF_CS_XATTR_ARCHIVE_UUID, "1");
+    ret = dict_set_sizen_str_sizen(local->xattr_req, GF_CS_XATTR_ARCHIVE_UUID,
+                                   "1");
 
     return 0;
 }
@@ -1272,7 +1269,7 @@ cs_resume_remote_readv(call_frame_t *frame, xlator_t *this, fd_t *fd,
 
     __cs_inode_ctx_get(this, fd->inode, &ctx);
 
-    state = __cs_get_file_state(this, fd->inode, ctx);
+    state = __cs_get_file_state(fd->inode, ctx);
     if (state == GF_CS_ERROR) {
         gf_msg(this->name, GF_LOG_ERROR, 0, 0,
                "status is GF_CS_ERROR."
@@ -1347,7 +1344,7 @@ cs_readv(call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
     __cs_inode_ctx_get(this, fd->inode, &ctx);
 
     if (ctx)
-        state = __cs_get_file_state(this, fd->inode, ctx);
+        state = __cs_get_file_state(fd->inode, ctx);
     else
         state = GF_CS_LOCAL;
 
@@ -1466,7 +1463,7 @@ cs_stat_check_cbk(call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
             goto err;
         }
 
-        ret = dict_get_str(xdata, GF_CS_OBJECT_REMOTE, &filepath);
+        ret = dict_get_str_sizen(xdata, GF_CS_OBJECT_REMOTE, &filepath);
         if (filepath) {
             gf_msg_debug(this->name, 0, "filepath returned %s", filepath);
             local->remotepath = gf_strdup(filepath);
@@ -1756,7 +1753,7 @@ cs_resume_setxattr(call_frame_t *frame, xlator_t *this, loc_t *loc,
 
     __cs_inode_ctx_get(this, loc->inode, &ctx);
 
-    state = __cs_get_file_state(this, loc->inode, ctx);
+    state = __cs_get_file_state(loc->inode, ctx);
 
     if (state == GF_CS_ERROR) {
         /* file is already remote */
@@ -1798,7 +1795,7 @@ unwind:
 }
 
 gf_cs_obj_state
-__cs_get_file_state(xlator_t *this, inode_t *inode, cs_inode_ctx_t *ctx)
+__cs_get_file_state(inode_t *inode, cs_inode_ctx_t *ctx)
 {
     gf_cs_obj_state state = -1;
 
@@ -1907,7 +1904,7 @@ cs_resume_postprocess(xlator_t *this, call_frame_t *frame, inode_t *inode)
 
     __cs_inode_ctx_get(this, inode, &ctx);
 
-    state = __cs_get_file_state(this, inode, ctx);
+    state = __cs_get_file_state(inode, ctx);
     if (state == GF_CS_ERROR) {
         gf_msg(this->name, GF_LOG_ERROR, 0, 0,
                "status is GF_CS_ERROR."
@@ -1931,56 +1928,6 @@ cs_resume_postprocess(xlator_t *this, call_frame_t *frame, inode_t *inode)
             ret = -1;
         }
     }
-out:
-    return ret;
-}
-
-int32_t
-__cs_get_dict_str(char **str, dict_t *xattr, const char *name, int *errnum)
-{
-    data_t *data = NULL;
-    int ret = -1;
-
-    assert(str != NULL);
-
-    data = dict_get(xattr, (char *)name);
-    if (!data) {
-        *errnum = ENODATA;
-        goto out;
-    }
-
-    *str = GF_CALLOC(data->len + 1, sizeof(char), gf_common_mt_char);
-    if (!(*str)) {
-        *errnum = ENOMEM;
-        goto out;
-    }
-
-    memcpy(*str, data->data, sizeof(char) * (data->len));
-    return 0;
-
-out:
-    return ret;
-}
-
-int32_t
-__cs_get_dict_uuid(uuid_t uuid, dict_t *xattr, const char *name, int *errnum)
-{
-    data_t *data = NULL;
-    int ret = -1;
-
-    assert(uuid != NULL);
-
-    data = dict_get(xattr, (char *)name);
-    if (!data) {
-        *errnum = ENODATA;
-        goto out;
-    }
-
-    assert(data->len == sizeof(uuid_t));
-
-    gf_uuid_copy(uuid, (unsigned char *)data->data);
-    return 0;
-
 out:
     return ret;
 }
